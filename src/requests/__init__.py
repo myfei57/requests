@@ -175,6 +175,9 @@ from .exceptions import (
     FileModeWarning,
     HTTPError,
     JSONDecodeError,
+    PaginationCycleError,
+    PaginationError,
+    PaginationOriginError,
     ReadTimeout,
     RequestException,
     Timeout,
@@ -182,7 +185,7 @@ from .exceptions import (
     URLRequired,
 )
 from .models import PreparedRequest, Request, Response
-from .sessions import Session, session
+from .sessions import LinkPaginationIterator, Session, session
 from .status_codes import codes
 
 __all__ = (
@@ -190,6 +193,10 @@ __all__ = (
     "ConnectTimeout",
     "HTTPError",
     "JSONDecodeError",
+    "LinkPaginationIterator",
+    "PaginationCycleError",
+    "PaginationError",
+    "PaginationOriginError",
     "PreparedRequest",
     "ReadTimeout",
     "Request",

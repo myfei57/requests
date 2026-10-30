@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import Generator, Mapping, MutableMapping
+from collections.abc import Generator, Iterator, Mapping, MutableMapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,6 +31,9 @@ from .exceptions import (
     ChunkedEncodingError,
     ContentDecodingError,
     InvalidSchema,
+    InvalidURL,
+    PaginationCycleError,
+    PaginationOriginError,
     TooManyRedirects,
 )
 from .hooks import default_hooks, dispatch_hook
@@ -392,6 +395,346 @@ class SessionRedirectMixin:
         prepared_request.method = method
 
 
+def _pagination_origin(url: str) -> tuple[str, str, int | None]:
+    """Return the ``(scheme, lowercase host, effective port)`` of a URL.
+
+    Explicit default ports are folded into their scheme's default port.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not parsed.scheme or hostname is None:
+        raise InvalidURL(f"Invalid pagination URL: {url!r}")
+    try:
+        port = parsed.port
+    except ValueError as e:
+        raise InvalidURL(f"Invalid pagination URL: {url!r}") from e
+    if port is None:
+        port = DEFAULT_PORTS.get(parsed.scheme)
+    return parsed.scheme, hostname.lower(), port
+
+
+def _normalize_pagination_url(url: str) -> str:
+    """Canonicalize a visited pagination URL.
+
+    The fragment is ignored; the query string is preserved.
+    """
+    return urlparse(url)._replace(fragment="").geturl()
+
+
+class LinkPaginationIterator(Iterator[Response]):
+    """Lazily iterate GET responses connected by ``rel="next"`` Link headers.
+
+    Returned by :meth:`Session.paginate`. No HTTP request is made until
+    iteration starts, and the next page is only requested when the caller
+    asks for it: pages are never prefetched.
+
+    Each ``rel="next"`` target is resolved against the *final* URL of the
+    current page (i.e. after redirects). The ``params`` passed to
+    :meth:`~Session.paginate` apply to the first request only and are never
+    re-appended to later pages; every page otherwise uses the session's
+    authentication, cookies and connection configuration. Response bodies
+    are always downloaded completely before the response is handed out.
+
+    After iteration finishes, inspect :attr:`truncated` and :attr:`next_url`
+    to tell a natural end (no ``rel="next"`` link) apart from a truncated one
+    (the page limit was reached while another page was available).
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        url: _t.UriType,
+        *,
+        max_pages: int,
+        params: _t.ParamsType = None,
+        headers: _t.HeadersType = None,
+        cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,
+        auth: _t.AuthType = None,
+        timeout: _t.TimeoutType = None,
+        proxies: dict[str, str] | None = None,
+        hooks: _t.HooksInputType | None = None,
+        verify: _t.VerifyType | None = None,
+        cert: _t.CertType = None,
+    ) -> None:
+        # bool is a subclass of int; reject it explicitly.
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int):
+            raise ValueError("max_pages must be a positive integer")
+        if max_pages <= 0:
+            raise ValueError("max_pages must be a positive integer")
+
+        if isinstance(url, bytes):
+            url = url.decode("utf-8")
+
+        self._session = session
+        self._url = url
+        self._max_pages = max_pages
+        self._params = params
+        self._headers = headers
+        self._cookies = cookies
+        self._auth = auth
+        self._timeout = timeout
+        self._proxies = proxies
+        self._hooks = hooks
+        self._verify = verify
+        self._cert = cert
+
+        self._visited: set[str] = set()
+        self._anchor: tuple[str, str, int | None] | None = None
+        self._anchor_url: str | None = None
+        self._pending_next: str | None = None
+        self._undelivered: Response | None = None
+        self._started = False
+        self._finished = False
+        self._closed = False
+
+        #: Number of pages (delivered responses), the first page included.
+        self.page_count: int = 0
+        #: True when iteration stopped at ``max_pages`` with a next link left.
+        self.truncated: bool = False
+        #: Resolved ``rel="next"`` URL of the last delivered page, if any.
+        self.next_url: str | None = None
+
+    def __iter__(self) -> LinkPaginationIterator:
+        return self
+
+    def __next__(self) -> Response:
+        if self._closed or self._finished:
+            raise StopIteration
+
+        response: Response | None = None
+        try:
+            if not self._started:
+                self._started = True
+                response = self._fetch_page(self._url, self._params, True)
+                # The origin of the first page's *final* URL anchors every
+                # later page and redirect hop.
+                final_url = response.url
+                self._anchor = _pagination_origin(final_url)
+                self._anchor_url = final_url
+            else:
+                url = self._pending_next
+                if url is None:
+                    raise StopIteration
+                # Both checks happen before the request is sent.
+                self._assert_same_origin(url)
+                if _normalize_pagination_url(url) in self._visited:
+                    raise PaginationCycleError(
+                        f"Pagination cycle detected: {url!r} was already visited."
+                    )
+                response = self._fetch_page(url, None, False)
+
+                final_url = response.url
+                if _normalize_pagination_url(final_url) in self._visited:
+                    raise PaginationCycleError(
+                        "Pagination cycle detected after redirects: "
+                        f"{final_url!r} was already visited."
+                    )
+
+            self._undelivered = response
+            self._visited.add(_normalize_pagination_url(response.url))
+            self.page_count += 1
+
+            next_url = self._extract_next_url(response)
+            self.next_url = next_url
+
+            if next_url is None:
+                self._finished = True
+            elif self.page_count >= self._max_pages:
+                # Limit reached with another page available: stop cleanly and
+                # report the truncation instead of fetching one more page.
+                self.truncated = True
+                self._finished = True
+            else:
+                self._pending_next = next_url
+
+            self._undelivered = None
+            return response
+        except BaseException:
+            if response is not None:
+                self._release_response(response)
+            self._undelivered = None
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release any response fetched but not yet handed to the caller."""
+        if self._undelivered is not None:
+            self._release_response(self._undelivered)
+            self._undelivered = None
+        self._closed = True
+
+    def __enter__(self) -> LinkPaginationIterator:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _assert_same_origin(self, url: str) -> None:
+        assert self._anchor is not None
+        if _pagination_origin(url) != self._anchor:
+            raise PaginationOriginError(
+                f"Refusing to follow pagination link to {url!r}: its scheme, "
+                f"host or effective port differs from the first page "
+                f"{self._anchor_url!r}."
+            )
+
+    def _extract_next_url(self, response: Response) -> str | None:
+        link = response.links.get("next")
+        if link is None:
+            return None
+        target = link.get("url")
+        if not target:
+            return None
+
+        base_url = response.url
+        # Protocol-relative link (see RFC 1808 Section 4), mirror the
+        # redirect handling in SessionRedirectMixin.resolve_redirects.
+        if target.startswith("//"):
+            target = f"{urlparse(base_url).scheme}:{target}"
+
+        parsed = urlparse(target)
+        if not parsed.netloc:
+            return urljoin(base_url, requote_uri(target))
+        return requote_uri(target)
+
+    def _prepare_page_request(self, url: str, params: _t.ParamsType) -> PreparedRequest:
+        """Prepare a GET like :meth:`Session.prepare_request`, but with the
+        exact (possibly empty) *params* given, without merging session params.
+        """
+        # Building the Request first normalizes the loose hooks input into
+        # the dictionary shape expected by merge_hooks.
+        page_request = Request(
+            method="GET",
+            url=url,
+            headers=self._headers,
+            cookies=self._cookies,
+            auth=self._auth,
+            hooks=self._hooks,
+        )
+
+        cookies = page_request.cookies or {}
+        if not isinstance(cookies, cookielib.CookieJar):
+            cookies = cookiejar_from_dict(cookies)
+        merged_cookies = merge_cookies(
+            merge_cookies(RequestsCookieJar(), self._session.cookies), cookies
+        )
+
+        auth = page_request.auth
+        if self._session.trust_env and not auth and not self._session.auth:
+            auth = get_netrc_auth(url)
+
+        prepared = PreparedRequest()
+        prepared.prepare(
+            method=cast(str, page_request.method).upper(),
+            url=cast("_t.UriType", page_request.url),
+            files=page_request.files,
+            data=page_request.data,
+            json=page_request.json,
+            headers=merge_setting(
+                page_request.headers,
+                self._session.headers,
+                dict_class=CaseInsensitiveDict,
+            ),
+            params=params,
+            auth=merge_setting(auth, self._session.auth),
+            cookies=merged_cookies,
+            hooks=merge_hooks(page_request.hooks, self._session.hooks),
+        )
+        return prepared
+
+    def _fetch_page(
+        self, url: str, params: _t.ParamsType, merge_session_params: bool
+    ) -> Response:
+        # Session-level params belong to the first request only, just like
+        # explicitly passed params: a rel="next" URL is already complete and
+        # must not get them re-appended. Everything else (headers, auth,
+        # cookies, hooks) still merges with the session configuration.
+        if merge_session_params:
+            params = merge_setting(params, self._session.params)
+        prepared = self._prepare_page_request(url, params)
+        assert _is_prepared(prepared)
+
+        proxies = dict(self._proxies) if self._proxies else {}
+        settings = self._session.merge_environment_settings(
+            prepared.url, proxies, False, self._verify, self._cert
+        )
+        send_kwargs: dict[str, Any] = {"timeout": self._timeout}
+        send_kwargs.update(settings)
+        send_kwargs["allow_redirects"] = False
+        # Pagination only supports the fully-buffered delivery mode.
+        send_kwargs["stream"] = False
+
+        response = self._session.send(prepared, **send_kwargs)
+        history: list[Response] = []
+
+        # Follow redirects manually so every hop can be checked against the
+        # first page's origin *before* the request is sent.
+        while response.is_redirect:
+            if len(history) >= self._session.max_redirects:
+                self._release_response(response)
+                raise TooManyRedirects(
+                    f"Exceeded {self._session.max_redirects} redirects.",
+                    response=response,
+                )
+
+            redirects = self._session.resolve_redirects(
+                response,
+                prepared,
+                stream=False,
+                timeout=self._timeout,
+                verify=send_kwargs["verify"],
+                cert=send_kwargs["cert"],
+                proxies=send_kwargs["proxies"],
+                yield_requests=True,
+            )
+            try:
+                next_request = cast("PreparedRequest", next(redirects))
+            except StopIteration:
+                break
+            finally:
+                redirects.close()
+
+            next_url = cast(str, next_request.url)
+            if self._anchor is not None:
+                self._assert_same_origin(next_url)
+
+            # resolve_redirects already consumed and closed this response.
+            history.append(response)
+            prepared = next_request
+            send_kwargs["proxies"] = self._session.rebuild_proxies(
+                prepared, send_kwargs["proxies"]
+            )
+            response = self._session.send(prepared, **send_kwargs)
+
+        response.history = history
+        # Guarantee the whole body has been read and the socket released.
+        try:
+            response.content
+        except BaseException:
+            # The response never reaches __next__ on failure, so release it
+            # here instead of leaking the underlying connection.
+            self._release_response(response)
+            raise
+        return response
+
+    @staticmethod
+    def _release_response(response: Response) -> None:
+        try:
+            response.content  # Consume socket so it can be released.
+        except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
+            try:
+                response.raw.read(decode_content=False)
+            except Exception:
+                pass
+        response.close()
+
+
 class Session(SessionRedirectMixin):
     """A Requests session.
 
@@ -669,6 +1012,72 @@ class Session(SessionRedirectMixin):
 
         kwargs.setdefault("allow_redirects", True)
         return self.request("GET", url, params=params, **kwargs)
+
+    def paginate(
+        self,
+        url: _t.UriType,
+        *,
+        max_pages: int,
+        params: _t.ParamsType = None,
+        headers: _t.HeadersType = None,
+        cookies: RequestsCookieJar | CookieJar | dict[str, str] | None = None,
+        auth: _t.AuthType = None,
+        timeout: _t.TimeoutType = None,
+        proxies: dict[str, str] | None = None,
+        hooks: _t.HooksInputType | None = None,
+        verify: _t.VerifyType | None = None,
+        cert: _t.CertType = None,
+    ) -> LinkPaginationIterator:
+        r"""Iterate GET responses linked by ``rel="next"`` Link headers.
+
+        Iteration starts with a GET to *url* and, for every returned page,
+        follows its ``Link: <...>; rel="next"`` header (RFC 8288) until no
+        next link is present. Pages are fetched lazily: a later page is only
+        requested when the caller continues iterating, and it is never
+        prefetched.
+
+        A relative ``rel="next"`` target is resolved against the final URL of
+        the current page (after redirects). *params* are sent with the first
+        request only and are not re-appended to later pages; each page still
+        uses this session's authentication, cookies and connection
+        configuration. Response bodies are always fully read before delivery,
+        so streaming is not supported.
+
+        :param max_pages: Required positive integer upper bound on the number
+            of pages returned; the first page counts towards it. If the bound
+            is reached while another ``rel="next"`` link is present,
+            iteration ends normally and the result is reported as truncated
+            via the iterator's ``truncated`` and ``next_url`` attributes.
+        :param params: (optional) Query parameters for the first request only.
+        :param headers: (optional) Headers sent with every page request.
+        :param cookies: (optional) Cookies sent with every page request.
+        :param auth: (optional) Auth attached to every page request.
+        :param timeout: (optional) Timeout applied to every page request.
+        :param proxies: (optional) Proxies applied to every page request.
+        :param hooks: (optional) Hooks registered on every page request.
+        :param verify: (optional) TLS verification for every page request.
+        :param cert: (optional) Client cert for every page request.
+        :rtype: LinkPaginationIterator
+        :raises PaginationCycleError: if a normalized URL (fragment ignored,
+            query preserved) is visited more than once.
+        :raises PaginationOriginError: if a next link or one of its
+            redirects changes the scheme, host or effective port of the
+            first page; the request is refused before being sent.
+        """
+        return LinkPaginationIterator(
+            self,
+            url,
+            max_pages=max_pages,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            timeout=timeout,
+            proxies=proxies,
+            hooks=hooks,
+            verify=verify,
+            cert=cert,
+        )
 
     def options(self, url: _t.UriType, **kwargs: Unpack[_t.RequestKwargs]) -> Response:
         r"""Sends a OPTIONS request. Returns :class:`Response` object.

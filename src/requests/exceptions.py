@@ -147,6 +147,25 @@ class UnrewindableBodyError(RequestException):
     """Requests encountered an error when trying to rewind a body."""
 
 
+class PaginationError(RequestException):
+    """Base class for errors while following ``rel="next"`` pagination links."""
+
+
+class PaginationCycleError(PaginationError):
+    """A pagination link pointed at a URL that was already visited.
+
+    URLs are compared with fragments stripped but query strings preserved.
+    """
+
+
+class PaginationOriginError(PaginationError):
+    """A pagination link (or one of its redirects) targeted a different
+    origin (scheme, host or effective port) than the first page.
+
+    The request is refused before it is sent.
+    """
+
+
 # Warnings
 
 
