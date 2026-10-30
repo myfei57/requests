@@ -206,6 +206,39 @@ You can get around this behaviour by explicitly merging the environment settings
 
     print(resp.status_code)
 
+Request Fingerprints
+--------------------
+
+Sometimes you need to de-duplicate requests before sending them, for example
+in a local cache or a retry queue.  :class:`PreparedRequest
+<requests.PreparedRequest>` provides
+:meth:`PreparedRequest.fingerprint() <requests.PreparedRequest.fingerprint>`,
+which returns a stable SHA-256 digest computed entirely on the local machine::
+
+    prepped = requests.Request(
+        "POST", "https://example.com/api", data=b"payload"
+    ).prepare()
+
+    digest = prepped.fingerprint(headers=["Content-Type", "Content-Length"])
+
+The digest covers the request method, the prepared URL with any fragment
+removed, and the body.  Only the headers you explicitly name are included:
+header names are matched case-insensitively, de-duplicated and sorted, and a
+header that is present with an empty value is distinguished from a missing
+one.  Headers you do not name are ignored completely, so two requests that
+only differ in unselected headers produce the same fingerprint.  The query
+string is hashed verbatim, preserving the original parameter order and any
+repeated parameters.
+
+Fingerprinting is read-only and never sends the request, runs authentication
+or modifies the prepared request.  A seekable binary stream body is read from
+its current position and rewound afterwards, whether fingerprinting succeeds
+or fails; non-seekable streams, iterators and other body types that cannot be
+safely rewound are rejected with a :exc:`TypeError` before they are consumed.
+Only the digest is returned -- the URL, headers and body are never part of
+the result.  Calling ``fingerprint()`` is entirely optional; requests are
+sent and redirected exactly as before when it is not used.
+
 .. _verification:
 
 SSL Cert Verification

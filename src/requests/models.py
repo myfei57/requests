@@ -13,13 +13,16 @@ import datetime
 # Implicit import within threads may cause LookupError when standard library is in a ZIP,
 # such as in Embedded Python. See https://github.com/psf/requests/issues/3578.
 import encodings.idna  # noqa: F401
+import hashlib
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from contextlib import suppress
 from io import UnsupportedOperation
 from typing import (
     TYPE_CHECKING,
     Any,
     Final,
     Literal,
+    Protocol,
     cast,
     overload,
 )
@@ -63,6 +66,7 @@ from .exceptions import (
     InvalidURL,
     MissingSchema,
     StreamConsumedError,
+    UnrewindableBodyError,
 )
 from .exceptions import JSONDecodeError as RequestsJSONDecodeError
 from .exceptions import SSLError as RequestsSSLError
@@ -103,6 +107,131 @@ REDIRECT_STATI: Final[tuple[int, ...]] = (  # type: ignore[assignment]
 DEFAULT_REDIRECT_LIMIT: int = 30
 CONTENT_CHUNK_SIZE: int = 10 * 1024
 ITER_CHUNK_SIZE: int = 512
+
+# ---------------------------------------------------------------------------
+# Local request fingerprint framing (see PreparedRequest.fingerprint)
+#
+# The input to SHA-256 is a versioned sequence of tagged, length-framed
+# fields, which makes field boundaries unambiguous: two requests that only
+# shift bytes between fields can never produce the same digest.  Every
+# variable-length field is framed as a one-byte tag followed by an 8-byte
+# big-endian length and the field bytes.  The body is the final field, so
+# its bytes are fed without an enclosing length frame.
+_FINGERPRINT_PREFIX: Final[bytes] = b"requests.PreparedRequest.fingerprint\x00v1\n"
+_FINGERPRINT_TAG_METHOD: Final[bytes] = b"M"
+_FINGERPRINT_TAG_METHOD_NONE: Final[bytes] = b"m"
+_FINGERPRINT_TAG_URL: Final[bytes] = b"U"
+_FINGERPRINT_TAG_HEADERS: Final[bytes] = b"H"
+_FINGERPRINT_TAG_HEADER: Final[bytes] = b"h"
+#: Selected header is present on the request (followed by its value frame).
+_FINGERPRINT_HEADER_PRESENT: Final[bytes] = b"P"
+#: Selected header is absent from the request, distinct from an empty value.
+_FINGERPRINT_HEADER_ABSENT: Final[bytes] = b"A"
+_FINGERPRINT_BODY_NONE: Final[bytes] = b"n"
+_FINGERPRINT_BODY_BYTES: Final[bytes] = b"b"
+_FINGERPRINT_LENGTH_PREFIX_BYTES: Final[int] = 8
+
+
+class _FingerprintHasher(Protocol):
+    """Structural type for the streaming hash object used below."""
+
+    def update(self, data: bytes | bytearray | memoryview, /) -> None: ...
+
+
+def _fingerprint_feed(hasher: _FingerprintHasher, tag: bytes, data: bytes) -> None:
+    """Feed a tagged, length-framed field into the fingerprint ``hasher``."""
+    hasher.update(tag)
+    hasher.update(len(data).to_bytes(_FINGERPRINT_LENGTH_PREFIX_BYTES, "big"))
+    hasher.update(data)
+
+
+def _fingerprint_stream_body(hasher: _FingerprintHasher, body: object) -> None:
+    """Hash a seekable binary stream body from its current position.
+
+    Seekability is verified before anything is read.  The stream position is
+    restored to the recorded starting position on both success and failure,
+    so the body remains usable for sending afterwards.
+    """
+    read_attr = getattr(body, "read", None)
+    if not callable(read_attr):
+        raise TypeError(
+            f"Cannot fingerprint a request body of type {type(body).__name__!s}: "
+            "only None, bytes-like objects and seekable binary streams are "
+            "supported."
+        )
+    read = cast("Callable[[int], bytes | bytearray | memoryview[bytes]]", read_attr)
+
+    seek_attr = getattr(body, "seek", None)
+    tell_attr = getattr(body, "tell", None)
+    if not callable(seek_attr) or not callable(tell_attr):
+        raise TypeError(
+            "Cannot fingerprint a request body stream that cannot be "
+            "rewound: the stream must provide seekable(), tell() and seek()."
+        )
+    seek = cast("Callable[[int], object]", seek_attr)
+    tell = cast("Callable[[], object]", tell_attr)
+
+    seekable_attr = getattr(body, "seekable", None)
+    if callable(seekable_attr):
+        seekable = cast("Callable[[], object]", seekable_attr)
+        try:
+            is_seekable = bool(seekable())
+        except OSError as exc:
+            raise TypeError(
+                "Cannot fingerprint a request body stream that cannot be "
+                "safely positioned."
+            ) from exc
+        if not is_seekable:
+            raise TypeError(
+                "Cannot fingerprint a non-seekable request body stream; "
+                "provide a seekable binary stream or a bytes-like body."
+            )
+
+    try:
+        start_position = tell()
+    except OSError as exc:
+        raise TypeError(
+            "Cannot determine the current position of the request body "
+            "stream, so it cannot be safely restored after fingerprinting."
+        ) from exc
+    if not isinstance(start_position, int) or isinstance(start_position, bool):
+        raise TypeError(
+            "Cannot fingerprint a request body stream whose tell() does not "
+            "return an integer byte position."
+        )
+
+    hasher.update(_FINGERPRINT_BODY_BYTES)
+    try:
+        while True:
+            chunk = read(CONTENT_CHUNK_SIZE)
+            if isinstance(chunk, str):
+                raise TypeError(
+                    "Cannot fingerprint a text request body stream; open "
+                    "the stream in binary mode or pass a bytes-like body."
+                )
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise TypeError(
+                    "Cannot fingerprint a request body stream whose read() "
+                    f"returns {type(chunk).__name__!s}: binary chunks are "
+                    "required."
+                )
+            if not chunk:
+                break
+            hasher.update(chunk if isinstance(chunk, bytes) else bytes(chunk))
+    except BaseException:
+        # Restore the original position even when reading fails, but surface
+        # the original error rather than a possible restore failure.
+        with suppress(OSError):
+            seek(start_position)
+        raise
+
+    try:
+        seek(start_position)
+    except OSError as exc:
+        raise UnrewindableBodyError(
+            "An error occurred while restoring the request body position "
+            "after fingerprinting."
+        ) from exc
 
 
 class RequestEncodingMixin:
@@ -727,6 +856,158 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         hooks = hooks or {}
         for event in hooks:
             self.register_hook(event, hooks[event])
+
+    def fingerprint(self, headers: Iterable[str] | None = None) -> str:
+        """Compute a stable local SHA-256 fingerprint of this prepared request.
+
+        The fingerprint is intended for callers that need to de-duplicate
+        requests that have already been prepared.  It is computed entirely
+        locally: it does not send the request, trigger authentication or
+        hooks, and it does not modify the request's method, URL, headers or
+        body.  Calling it is optional; requests that never call this method
+        are sent and redirected exactly as before.
+
+        The fingerprint is computed from, in order:
+
+        * the request :attr:`method`;
+        * the prepared :attr:`url` with any URL fragment removed.  The query
+          string is hashed verbatim, so its original parameter order and any
+          repeated parameters are preserved;
+        * only the request headers named in ``headers``.  Header names are
+          matched case-insensitively, de-duplicated case-insensitively and
+          sorted in stable case-insensitive order.  A selected header that is
+          present with an empty value is hashed differently from one that is
+          missing.  Headers that are not named in ``headers`` are not
+          inspected at all, so requests that differ only in unselected
+          headers produce the same fingerprint;
+        * the request :attr:`body`.
+
+        Only the lowercase hexadecimal SHA-256 digest is returned.  The URL,
+        header values and body are fed to the hash but are never returned,
+        logged or otherwise exposed by this method.
+
+        The hashed fields use a versioned, length-framed encoding with
+        explicit field boundaries, so shifting bytes between fields can
+        never produce a collision.
+
+        :param headers: iterable of names of the headers to cover.  Header
+            names must be strings.  ``None`` (the default) covers no headers.
+        :returns: the 64-character lowercase hexadecimal SHA-256 digest.
+
+        **Body handling.**
+
+        * ``None`` and bytes-like bodies are hashed as-is.
+        * A seekable binary file-like body is read in chunks, starting at its
+          current position (so a partially consumed stream fingerprints the
+          bytes that would actually be sent).  When fingerprinting finishes,
+          whether successfully or with an error, the stream is rewound to the
+          position it had when this method was called, leaving it ready to
+          send.
+        * Non-seekable streams, streams without ``tell()`` or ``seek()``,
+          iterators and generators, and any other unsupported body type
+          raise :exc:`TypeError` before anything is consumed.
+        * Text (``str``) bodies are not accepted; encode them (for example
+          with ``body.encode("utf-8")``) first.
+
+        :raises ValueError: if the request has no prepared URL.
+        :raises TypeError: if a selected header name is not a string, a
+            selected header value is not ``str``/``bytes``, or the body
+            cannot be fingerprinted as described above.
+        :raises requests.exceptions.UnrewindableBodyError: if a stream body
+            cannot be restored to its original position after a successful
+            read.  Errors raised by the stream itself are propagated after
+            attempting to restore the position.
+        """
+        hasher = hashlib.sha256()
+        hasher.update(_FINGERPRINT_PREFIX)
+
+        # Method.
+        if self.method is None:
+            hasher.update(_FINGERPRINT_TAG_METHOD_NONE)
+        else:
+            _fingerprint_feed(
+                hasher, _FINGERPRINT_TAG_METHOD, self.method.encode("utf-8")
+            )
+
+        # Prepared URL with the fragment removed.  The query string is taken
+        # verbatim (never parsed), preserving parameter order and duplicates.
+        if self.url is None:
+            raise ValueError(
+                "Cannot fingerprint a PreparedRequest that has no prepared URL."
+            )
+        split_result = urlsplit(self.url)
+        url_without_fragment = urlunparse(
+            (
+                split_result.scheme,
+                split_result.netloc,
+                split_result.path,
+                "",
+                split_result.query,
+                "",
+            )
+        )
+        _fingerprint_feed(
+            hasher,
+            _FINGERPRINT_TAG_URL,
+            url_without_fragment.encode("utf-8"),
+        )
+
+        # Only the caller-selected headers: normalize names to lowercase,
+        # de-duplicate and sort them for a stable ordering.
+        selected_names: dict[str, None] = {}
+        if headers is not None:
+            for name in headers:
+                if not isinstance(name, str):
+                    raise TypeError(
+                        "fingerprint() header names must be strings, not "
+                        f"{type(name).__name__!s}."
+                    )
+                selected_names.setdefault(name.lower(), None)
+        ordered_names = sorted(selected_names)
+
+        hasher.update(_FINGERPRINT_TAG_HEADERS)
+        hasher.update(
+            len(ordered_names).to_bytes(_FINGERPRINT_LENGTH_PREFIX_BYTES, "big")
+        )
+        for name in ordered_names:
+            _fingerprint_feed(hasher, _FINGERPRINT_TAG_HEADER, name.encode("utf-8"))
+            if name in self.headers:
+                value = self.headers[name]
+                if isinstance(value, str):
+                    value_bytes: bytes = value.encode("utf-8")
+                elif isinstance(value, (bytes, bytearray, memoryview)):
+                    value_bytes = bytes(value)
+                elif value is None:
+                    # Defensive handling for manually built PreparedRequests.
+                    value_bytes = b""
+                else:
+                    raise TypeError(
+                        "Cannot fingerprint header "
+                        f"{name!r} with a value of type "
+                        f"{type(value).__name__!s}: str or bytes is required."
+                    )
+                # Present, even when the value is empty: distinct from absent.
+                _fingerprint_feed(hasher, _FINGERPRINT_HEADER_PRESENT, value_bytes)
+            else:
+                hasher.update(_FINGERPRINT_HEADER_ABSENT)
+
+        # Body.  This is the final field, so stream bodies are fed to the
+        # hash directly without being buffered.
+        body = self.body
+        if body is None:
+            hasher.update(_FINGERPRINT_BODY_NONE)
+        elif isinstance(body, (bytes, bytearray, memoryview)):
+            hasher.update(_FINGERPRINT_BODY_BYTES)
+            hasher.update(body if isinstance(body, bytes) else bytes(body))
+        elif isinstance(body, str):
+            raise TypeError(
+                "Cannot fingerprint a str request body; encode it to bytes "
+                "(for example body.encode('utf-8')) first."
+            )
+        else:
+            _fingerprint_stream_body(hasher, body)
+
+        return hasher.hexdigest()
 
 
 class Response:
