@@ -9,6 +9,7 @@ import pickle
 import re
 import tempfile
 import threading
+import time
 import warnings
 from unittest import mock
 
@@ -29,7 +30,12 @@ from requests.compat import (
     is_urllib3_1,
     urlparse,
 )
-from requests.cookies import cookiejar_from_dict, morsel_to_cookie
+from requests.cookies import (
+    CookiePolicyExplainError,
+    cookiejar_from_dict,
+    explain_cookie_send,
+    morsel_to_cookie,
+)
 from requests.exceptions import (
     ChunkedEncodingError,
     ConnectionError,
@@ -2531,6 +2537,490 @@ class TestMorselToCookieMaxAge:
         morsel["max-age"] = "woops"
         with pytest.raises(TypeError):
             morsel_to_cookie(morsel)
+
+
+class TestExplainCookieSend:
+    """Tests for requests.cookies.explain_cookie_send."""
+
+    def _prepare(self, url="http://example.com/", **kwargs):
+        method = kwargs.pop("method", "GET")
+        return requests.Request(method, url, **kwargs).prepare()
+
+    def _jar(self, *cookies):
+        jar = requests.cookies.RequestsCookieJar()
+        for cookie in cookies:
+            jar.set_cookie(requests.cookies.create_cookie(**cookie))
+        return jar
+
+    def _choices_by(self, explanation, name):
+        return [choice for choice in explanation.cookies if choice.name == name]
+
+    def _actual_header_names(self, jar, request):
+        # get_cookie_header() may evict expired cookies from the jar, so use a
+        # copy. Only cookie names are taken from the header, never values.
+        header = requests.cookies.get_cookie_header(jar.copy(), request)
+        if header is None:
+            return collections.Counter()
+        return collections.Counter(part.split("=", 1)[0] for part in header.split("; "))
+
+    def test_fields_and_basic_selection(self):
+        jar = self._jar(
+            {"name": "match", "value": "secret-match", "domain": "example.com"},
+            {"name": "nope", "value": "secret-nope", "domain": "other.org"},
+        )
+        explanation = explain_cookie_send(jar, self._prepare())
+
+        assert explanation.scheme == "http"
+        assert explanation.host == "example.com"
+        assert explanation.url_host == "example.com"
+        assert explanation.host_overridden is False
+        assert explanation.path == "/"
+        assert explanation.explicit_cookie_header is False
+
+        match = self._choices_by(explanation, "match")[0]
+        assert match.domain == "example.com"
+        assert match.path == "/"
+        assert match.selected is True
+        assert match.host_only is False
+        assert match.secure is False
+        assert match.expired is False
+        assert "would be sent" in match.reason
+
+        nope = self._choices_by(explanation, "nope")[0]
+        assert nope.selected is False
+        assert "domain-match" in nope.reason
+
+        selected = explanation.selected_cookies()
+        assert [choice.name for choice in selected] == ["match"]
+        assert "1 of 2" in explanation.note
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        (
+            ("http://example.com/", True),
+            ("http://www.example.com/", True),
+            ("http://sub.www.example.com/", True),
+            ("http://notexample.com/", False),
+            ("http://example.com.evil/", False),
+            ("http://evil/?x=1", False),
+        ),
+    )
+    @pytest.mark.parametrize("cookie_domain", ("example.com", ".example.com"))
+    def test_domain_boundaries(self, url, expected, cookie_domain):
+        jar = self._jar(
+            {"name": "c", "value": "secret-domain", "domain": cookie_domain}
+        )
+        request = self._prepare(url)
+        explanation = explain_cookie_send(jar, request)
+        choice = explanation.cookies[0]
+        assert choice.selected is expected
+        assert self._actual_header_names(jar, request)["c"] == int(expected)
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        (
+            ("http://example.com/foo", True),
+            ("http://example.com/foo/", True),
+            ("http://example.com/foo/bar", True),
+            ("http://example.com/foobar", False),
+            ("http://example.com/fooother", False),
+            ("http://example.com/", False),
+            ("http://example.com/other", False),
+        ),
+    )
+    def test_path_boundaries(self, url, expected):
+        jar = self._jar(
+            {
+                "name": "c",
+                "value": "secret-path",
+                "domain": "example.com",
+                "path": "/foo",
+            }
+        )
+        request = self._prepare(url)
+        explanation = explain_cookie_send(jar, request)
+        choice = explanation.cookies[0]
+        assert choice.selected is expected
+        if not expected:
+            assert "path-match" in choice.reason
+        assert self._actual_header_names(jar, request)["c"] == int(expected)
+
+    def test_path_trailing_slash_boundary(self):
+        jar = self._jar(
+            {
+                "name": "c",
+                "value": "secret-trail",
+                "domain": "example.com",
+                "path": "/foo/",
+            }
+        )
+        request = self._prepare("http://example.com/foo")
+        choice = explain_cookie_send(jar, request).cookies[0]
+        assert choice.selected is False
+
+        request = self._prepare("http://example.com/foo/bar")
+        choice = explain_cookie_send(jar, request).cookies[0]
+        assert choice.selected is True
+
+    def test_secure_scheme_boundaries(self):
+        jar = self._jar(
+            {
+                "name": "secure_cookie",
+                "value": "secret-secure",
+                "domain": "example.com",
+                "secure": True,
+            },
+            {"name": "plain_cookie", "value": "secret-plain", "domain": "example.com"},
+        )
+
+        http_request = self._prepare("http://example.com/")
+        http_explanation = explain_cookie_send(jar, http_request)
+        secure = self._choices_by(http_explanation, "secure_cookie")[0]
+        assert secure.selected is False
+        assert "secure" in secure.reason.lower()
+        assert self._choices_by(http_explanation, "plain_cookie")[0].selected is True
+
+        https_request = self._prepare("https://example.com/")
+        https_explanation = explain_cookie_send(jar, https_request)
+        assert self._choices_by(https_explanation, "secure_cookie")[0].selected is True
+        assert self._choices_by(https_explanation, "plain_cookie")[0].selected is True
+        assert self._actual_header_names(jar, https_request)["secure_cookie"] == 1
+
+    def test_expiry_is_evaluated_for_every_cookie(self):
+        future = int(time.time()) + 3600
+        past = int(time.time()) - 3600
+        jar = self._jar(
+            {
+                "name": "future",
+                "value": "secret-future",
+                "domain": "example.com",
+                "expires": future,
+                "discard": False,
+            },
+            {
+                "name": "past",
+                "value": "secret-past",
+                "domain": "example.com",
+                "expires": past,
+                "discard": False,
+            },
+            {"name": "session", "value": "secret-session", "domain": "example.com"},
+        )
+        explanation = explain_cookie_send(jar, self._prepare())
+
+        by_name = {choice.name: choice for choice in explanation.cookies}
+        assert by_name["future"].selected is True
+        assert by_name["future"].expired is False
+        assert by_name["past"].selected is False
+        assert by_name["past"].expired is True
+        assert "expired" in by_name["past"].reason
+        assert by_name["session"].selected is True
+        assert by_name["session"].expired is False
+
+        # The expired cookie is explained, not evicted from the caller's jar.
+        assert len(jar) == 3
+
+    def test_same_name_different_domain_and_path_reported_separately(self):
+        jar = self._jar(
+            {
+                "name": "dup",
+                "value": "secret-one",
+                "domain": "example.com",
+                "path": "/",
+            },
+            {
+                "name": "dup",
+                "value": "secret-two",
+                "domain": ".example.com",
+                "path": "/",
+            },
+            {
+                "name": "dup",
+                "value": "secret-three",
+                "domain": "example.com",
+                "path": "/sub",
+            },
+        )
+        request = self._prepare("http://www.example.com/sub/page")
+        explanation = explain_cookie_send(jar, request)
+
+        choices = self._choices_by(explanation, "dup")
+        assert len(choices) == 3
+        assert {choice.path for choice in choices} == {"/", "/sub"}
+        assert {choice.domain for choice in choices} == {"example.com", ".example.com"}
+        assert all(choice.selected for choice in choices)
+
+        # The actual Cookie header carries the name three times, matching the
+        # explanation exactly (compared as a multiset, not by-name dict).
+        assert self._actual_header_names(jar, request) == collections.Counter(dup=3)
+
+    def test_explanation_matches_actual_cookie_header(self):
+        jar = self._jar(
+            {
+                "name": "root",
+                "value": "secret-root",
+                "domain": "example.com",
+                "path": "/",
+            },
+            {
+                "name": "sub_only",
+                "value": "secret-sub",
+                "domain": ".example.com",
+                "path": "/",
+            },
+            {
+                "name": "api",
+                "value": "secret-api",
+                "domain": "example.com",
+                "path": "/api",
+            },
+            {
+                "name": "secure",
+                "value": "secret-sec",
+                "domain": "example.com",
+                "secure": True,
+            },
+            {
+                "name": "dead",
+                "value": "secret-dead",
+                "domain": "example.com",
+                "expires": 1,
+                "discard": False,
+            },
+            {"name": "other", "value": "secret-other", "domain": "other.org"},
+            {
+                "name": "dup",
+                "value": "secret-a",
+                "domain": "example.com",
+                "path": "/api",
+            },
+            {"name": "dup", "value": "secret-b", "domain": ".example.com", "path": "/"},
+        )
+
+        for url in (
+            "http://example.com/",
+            "http://www.example.com/api/v2/x",
+            "https://example.com/api",
+            "http://other.org/api",
+        ):
+            request = self._prepare(url)
+            explanation = explain_cookie_send(jar, request)
+            explained = collections.Counter(
+                choice.name for choice in explanation.cookies if choice.selected
+            )
+            assert explained == self._actual_header_names(jar, request)
+
+    def test_host_header_overrides_url_host(self):
+        jar = self._jar(
+            {"name": "target", "value": "secret-target", "domain": "target.test"},
+            {
+                "name": "urlhost",
+                "value": "secret-urlhost",
+                "domain": "url-host.example",
+            },
+        )
+        request = self._prepare(
+            "http://url-host.example/path", headers={"Host": "target.test"}
+        )
+        explanation = explain_cookie_send(jar, request)
+
+        assert explanation.url_host == "url-host.example"
+        assert explanation.host == "target.test"
+        assert explanation.host_overridden is True
+        assert self._choices_by(explanation, "target")[0].selected is True
+        assert self._choices_by(explanation, "urlhost")[0].selected is False
+        assert "target.test" in explanation.note
+        assert self._actual_header_names(jar, request)["target"] == 1
+
+    def test_explicit_cookie_header_takes_precedence(self):
+        jar = self._jar(
+            {"name": "jar_cookie", "value": "secret-jar", "domain": "example.com"}
+        )
+        request = self._prepare(
+            "http://example.com/", headers={"Cookie": "session=TOP-SECRET-VALUE"}
+        )
+        explanation = explain_cookie_send(jar, request)
+
+        assert explanation.explicit_cookie_header is True
+        assert explanation.selected_cookies() == []
+        choice = explanation.cookies[0]
+        assert choice.selected is False
+        assert "takes precedence" in choice.reason
+        assert "precedence" in explanation.note
+
+        # The existing header value must never appear anywhere in the result,
+        # and neither must the jar cookie value.
+        rendered = (
+            repr(explanation)
+            + explanation.note
+            + "".join(repr(choice) + choice.reason for choice in explanation.cookies)
+        )
+        assert "TOP-SECRET-VALUE" not in rendered
+        assert "session=" not in rendered
+        assert "secret-jar" not in rendered
+
+        # The request and its header are untouched.
+        assert request.headers["Cookie"] == "session=TOP-SECRET-VALUE"
+
+    def test_blocked_domain_reason(self):
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set_policy(cookielib.DefaultCookiePolicy(blocked_domains=["example.com"]))
+        jar.set_cookie(
+            requests.cookies.create_cookie(
+                name="blocked", value="secret-blocked", domain="example.com"
+            )
+        )
+        explanation = explain_cookie_send(jar, self._prepare())
+        choice = explanation.cookies[0]
+        assert choice.selected is False
+        assert "block-list" in choice.reason
+
+    def test_plain_stdlib_cookiejar_is_supported(self):
+        jar = cookielib.CookieJar()
+        jar.set_cookie(
+            requests.cookies.create_cookie(
+                name="plain", value="secret-plain", domain="example.com"
+            )
+        )
+        explanation = explain_cookie_send(jar, self._prepare())
+        assert explanation.cookies[0].selected is True
+
+    def test_custom_cookie_policy_raises_safe_error(self):
+        class CustomPolicy(cookielib.DefaultCookiePolicy):
+            def return_ok(self, cookie, request):
+                return False
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set_policy(CustomPolicy())
+        jar.set_cookie(
+            requests.cookies.create_cookie(
+                name="custom", value="secret-custom", domain="example.com"
+            )
+        )
+        with pytest.raises(CookiePolicyExplainError) as excinfo:
+            explain_cookie_send(jar, self._prepare())
+        message = str(excinfo.value)
+        assert "CustomPolicy" in message
+        assert "secret-custom" not in message
+        assert "custom" not in message
+
+    def test_base_cookie_policy_raises_safe_error(self):
+        jar = cookielib.CookieJar(policy=cookielib.CookiePolicy())
+        with pytest.raises(CookiePolicyExplainError) as excinfo:
+            explain_cookie_send(jar, self._prepare())
+        assert "DefaultCookiePolicy" in str(excinfo.value)
+
+    def test_custom_jar_selection_raises_safe_error(self):
+        class CustomJar(requests.cookies.RequestsCookieJar):
+            def add_cookie_header(self, request):
+                super().add_cookie_header(request)
+
+        jar = CustomJar()
+        jar.set_cookie(
+            requests.cookies.create_cookie(
+                name="custom", value="secret-custom", domain="example.com"
+            )
+        )
+        with pytest.raises(CookiePolicyExplainError):
+            explain_cookie_send(jar, self._prepare())
+
+    def test_non_cookiejar_raises_type_error(self):
+        with pytest.raises(TypeError):
+            explain_cookie_send({}, self._prepare())
+
+    def test_does_not_mutate_jar_cookies_or_request(self):
+        past = int(time.time()) - 60
+        jar = self._jar(
+            {"name": "alive", "value": "secret-alive", "domain": "example.com"},
+            {
+                "name": "dead",
+                "value": "secret-dead",
+                "domain": "example.com",
+                "expires": past,
+                "discard": False,
+            },
+        )
+
+        def jar_snapshot():
+            return [
+                (
+                    cookie.name,
+                    cookie.value,
+                    cookie.domain,
+                    cookie.path,
+                    cookie.secure,
+                    cookie.expires,
+                    cookie.discard,
+                )
+                for cookie in jar
+            ]
+
+        request = self._prepare(
+            url="http://example.com/submit",
+            method="POST",
+            data={"secret_field": "BODY-SECRET-VALUE"},
+            headers={"Authorization": "Bearer AUTH-SECRET-TOKEN"},
+        )
+        before = jar_snapshot()
+        headers_before = dict(request.headers)
+        body_before = request.body
+
+        explanation = explain_cookie_send(jar, request)
+
+        # Jar, cookies and request are byte-for-byte unchanged; expired
+        # cookies are explained rather than evicted.
+        assert jar_snapshot() == before
+        assert len(jar) == 2
+        assert dict(request.headers) == headers_before
+        assert request.body == body_before
+
+        # Values, credentials and body data never appear in the result.
+        rendered = (
+            repr(explanation)
+            + explanation.note
+            + "".join(repr(choice) + choice.reason for choice in explanation.cookies)
+        )
+        for secret in (
+            "secret-alive",
+            "secret-dead",
+            "BODY-SECRET-VALUE",
+            "AUTH-SECRET-TOKEN",
+        ):
+            assert secret not in rendered
+
+    def test_url_userinfo_never_leaks_into_result(self):
+        jar = self._jar(
+            {"name": "other", "value": "secret-other", "domain": "other.org"}
+        )
+        request = self._prepare("https://user:URL-CREDENTIAL-SECRET@example.com/")
+        explanation = explain_cookie_send(jar, request)
+
+        assert explanation.host == "example.com"
+        assert explanation.url_host == "example.com"
+        rendered = (
+            repr(explanation)
+            + explanation.note
+            + "".join(repr(choice) + choice.reason for choice in explanation.cookies)
+        )
+        assert "URL-CREDENTIAL-SECRET" not in rendered.lower()
+        assert "user" not in explanation.host
+
+    def test_existing_explicit_header_behavior_unchanged(self):
+        session = requests.Session()
+        session.cookies.set_cookie(
+            requests.cookies.create_cookie(
+                name="jar_cookie", value="secret-jar", domain="example.com"
+            )
+        )
+        request = session.prepare_request(
+            requests.Request(
+                "GET",
+                "http://example.com/",
+                headers={"Cookie": "session=EXPLICIT-SECRET"},
+            )
+        )
+        # The explicit header wins and is sent unchanged by prepare_request.
+        assert request.headers["Cookie"] == "session=EXPLICIT-SECRET"
 
 
 class TestTimeout:

@@ -13,8 +13,8 @@ import calendar
 import copy
 import time
 from collections.abc import Iterator, MutableMapping
-from http.cookiejar import Cookie, CookieJar, CookiePolicy
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from http.cookiejar import Cookie, CookieJar, CookiePolicy, DefaultCookiePolicy
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from ._internal_utils import to_native_string
 from ._types import is_prepared as _is_prepared
@@ -159,6 +159,527 @@ def get_cookie_header(jar: CookieJar, request: PreparedRequest) -> str | None:
     r = MockRequest(request)
     jar.add_cookie_header(r)  # type: ignore[arg-type]
     return r.get_new_headers().get("Cookie")
+
+
+class CookiePolicyExplainError(RuntimeError):
+    """Cookie send-selection cannot be safely explained.
+
+    Raised by :func:`explain_cookie_send` when the jar's
+    :class:`~http.cookiejar.CookiePolicy` (or the jar itself) overrides the
+    standard :class:`~http.cookiejar.DefaultCookiePolicy` decision methods.
+    In that case the per-cookie reasons reported here could not be trusted to
+    match the cookies actually sent, so no explanation is fabricated.
+
+    The error message intentionally contains neither cookie names/values, nor
+    any request header or body content -- only the offending class name.
+    """
+
+
+class CookieSendChoice:
+    """Explanation of whether one cookie in the jar would be sent.
+
+    Cookies sharing a name but having a different ``domain`` or ``path`` are
+    always reported as separate :class:`CookieSendChoice` objects.
+
+    Cookie *values* are deliberately not part of this object.
+
+    .. attribute:: name
+    .. attribute:: domain
+    .. attribute:: path
+    .. attribute:: host_only
+        ``True`` when the cookie was accepted without a ``Domain`` attribute.
+    .. attribute:: secure
+        ``True`` when the cookie is only sent over secure protocols.
+    .. attribute:: expired
+        ``True`` when the cookie is expired at the single point in time at
+        which the whole explanation was evaluated.
+    .. attribute:: selected
+        ``True`` exactly when this cookie would appear in the ``Cookie``
+        header produced for the same jar and :class:`PreparedRequest`.
+    .. attribute:: reason
+        Human-readable reason for the decision. Never contains cookie values.
+    """
+
+    __slots__ = (
+        "name",
+        "domain",
+        "path",
+        "host_only",
+        "secure",
+        "expired",
+        "selected",
+        "reason",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        domain: str,
+        path: str,
+        host_only: bool,
+        secure: bool,
+        expired: bool,
+        selected: bool,
+        reason: str,
+    ) -> None:
+        self.name = name
+        self.domain = domain
+        self.path = path
+        self.host_only = host_only
+        self.secure = secure
+        self.expired = expired
+        self.selected = selected
+        self.reason = reason
+
+    def __repr__(self) -> str:
+        return (
+            f"CookieSendChoice(name={self.name!r}, domain={self.domain!r}, "
+            f"path={self.path!r}, host_only={self.host_only!r}, "
+            f"secure={self.secure!r}, expired={self.expired!r}, "
+            f"selected={self.selected!r})"
+        )
+
+
+class CookieSendExplanation:
+    """Result of :func:`explain_cookie_send`.
+
+    .. attribute:: url_host
+        Host taken from the request URL.
+    .. attribute:: host
+        Effective host used for domain matching. Identical to ``url_host``
+        unless the request overrides it with an explicit ``Host`` header.
+    .. attribute:: host_overridden
+        ``True`` when the request carries a ``Host`` header that replaces the
+        URL host for cookie matching.
+    .. attribute:: scheme
+        Request scheme (``"http"``/``"https"``) used for the secure check.
+    .. attribute:: path
+        Request path used for path matching (never includes the query string).
+    .. attribute:: explicit_cookie_header
+        ``True`` when the request already has a ``Cookie`` header. When so,
+        that header is sent as-is and takes precedence; no jar cookies are
+        added, and the header's content is never read or displayed.
+    .. attribute:: note
+        Short summary of the overall decision.
+    .. attribute:: cookies
+        One :class:`CookieSendChoice` per cookie in the jar, in jar storage
+        order. Same-named cookies with different domain/path are listed
+        separately.
+    """
+
+    __slots__ = (
+        "url_host",
+        "host",
+        "host_overridden",
+        "scheme",
+        "path",
+        "explicit_cookie_header",
+        "note",
+        "cookies",
+    )
+
+    def __init__(
+        self,
+        *,
+        url_host: str,
+        host: str,
+        host_overridden: bool,
+        scheme: str,
+        path: str,
+        explicit_cookie_header: bool,
+        note: str,
+        cookies: list[CookieSendChoice],
+    ) -> None:
+        self.url_host = url_host
+        self.host = host
+        self.host_overridden = host_overridden
+        self.scheme = scheme
+        self.path = path
+        self.explicit_cookie_header = explicit_cookie_header
+        self.note = note
+        self.cookies = cookies
+
+    def selected_cookies(self) -> list[CookieSendChoice]:
+        """Return only the choices that would actually be sent."""
+        return [choice for choice in self.cookies if choice.selected]
+
+    def __repr__(self) -> str:
+        selected = sum(1 for choice in self.cookies if choice.selected)
+        return (
+            f"CookieSendExplanation(host={self.host!r}, scheme={self.scheme!r}, "
+            f"path={self.path!r}, explicit_cookie_header="
+            f"{self.explicit_cookie_header!r}, selected={selected}, "
+            f"candidates={len(self.cookies)})"
+        )
+
+
+# Selection-relevant DefaultCookiePolicy methods. If any of these is
+# overridden by a custom policy, standard reasons cannot be guaranteed to
+# describe that policy's actual decisions.
+_EXPLAIN_POLICY_METHODS: tuple[str, ...] = (
+    "return_ok",
+    "return_ok_version",
+    "return_ok_verifiability",
+    "return_ok_secure",
+    "return_ok_expires",
+    "return_ok_port",
+    "return_ok_domain",
+    "domain_return_ok",
+    "path_return_ok",
+    "is_blocked",
+    "is_not_allowed",
+)
+
+# Selection-relevant CookieJar methods. Custom jars (or future stdlib
+# versions) overriding these select cookies differently than explained here.
+_EXPLAIN_JAR_METHODS: tuple[str, ...] = (
+    "add_cookie_header",
+    "_cookies_for_request",
+    "_cookies_for_domain",
+)
+
+_EXPLICIT_HEADER_REASON = (
+    "the request already has an explicit Cookie header, which is sent "
+    "unchanged and takes precedence; no cookies from the jar are added to it"
+)
+
+
+# Thin, typed wrappers around untyped http.cookiejar helpers used by the
+# explanation. They only read request metadata and never mutate anything.
+def _request_path(req: MockRequest) -> str:
+    return cast(str, cookielib.request_path(req))  # type: ignore[attr-defined]
+
+
+def _request_port(req: MockRequest) -> str | None:
+    return cast("str | None", cookielib.request_port(req))  # type: ignore[attr-defined]
+
+
+def _safe_request_host(req: MockRequest) -> str:
+    """Effective request host safe for display.
+
+    Uses ``urlparse().hostname`` so userinfo (``user:password@``) embedded in
+    a URL and port numbers can never appear in explanation output, while
+    still honouring the ``Host``-header override applied by
+    :meth:`MockRequest.get_full_url`.
+    """
+    return urlparse(req.get_full_url()).hostname or ""
+
+
+def _explain_supported(jar: CookieJar, policy: CookiePolicy) -> None:
+    """Raise unless jar/policy use the unmodified standard selection rules."""
+    if not isinstance(policy, DefaultCookiePolicy):
+        raise CookiePolicyExplainError(
+            "Cannot safely explain cookie send-selection: the jar uses "
+            f"cookie policy {type(policy).__name__!r}, which is not the "
+            "standard http.cookiejar.DefaultCookiePolicy."
+        )
+
+    for method_name in _EXPLAIN_POLICY_METHODS:
+        method = getattr(type(policy), method_name, None)
+        standard = getattr(DefaultCookiePolicy, method_name, None)
+        if method is None or standard is None or method is not standard:
+            raise CookiePolicyExplainError(
+                "Cannot safely explain cookie send-selection: the jar's "
+                f"policy {type(policy).__name__!r} overrides the standard "
+                f"decision method {method_name}(), so per-cookie reasons "
+                "could not be guaranteed to match the cookies actually sent."
+            )
+
+    for method_name in _EXPLAIN_JAR_METHODS:
+        method = getattr(type(jar), method_name, None)
+        standard = getattr(CookieJar, method_name, None)
+        if method is None or standard is None or method is not standard:
+            raise CookiePolicyExplainError(
+                "Cannot safely explain cookie send-selection: cookie jar "
+                f"{type(jar).__name__!r} overrides the standard selection "
+                f"method {method_name}(), so per-cookie reasons could not be "
+                "guaranteed to match the cookies actually sent."
+            )
+
+    if not isinstance(getattr(jar, "_cookies", None), dict):
+        raise CookiePolicyExplainError(
+            "Cannot safely explain cookie send-selection: cookie jar "
+            f"{type(jar).__name__!r} does not use the standard cookie "
+            "storage layout."
+        )
+
+
+def _domain_gate_reason(
+    policy: DefaultCookiePolicy, domain: str, req: MockRequest
+) -> str:
+    """Classify *why* a cookie-domain key failed domain_return_ok().
+
+    The pass/fail decision itself comes from the policy; this only produces
+    the human-readable label, so it never affects selection.
+    """
+    if policy.is_blocked(domain):
+        return (
+            f"cookie domain {domain!r} is on the policy block-list, so it is "
+            "not returned to this host"
+        )
+    if policy.is_not_allowed(domain):
+        return (
+            f"cookie domain {domain!r} is not on the policy allow-list, so it "
+            "is not returned to this host"
+        )
+    effective_host = _safe_request_host(req)
+    return (
+        f"cookie domain {domain!r} does not domain-match the effective "
+        f"request host {effective_host!r}; cookies are only returned to the "
+        "same host or one of its subdomains"
+    )
+
+
+def _cookie_return_reason(
+    policy: DefaultCookiePolicy,
+    cookie: Cookie,
+    req: MockRequest,
+    now: int,
+) -> tuple[bool, str | None]:
+    """Mirror DefaultCookiePolicy.return_ok() at a fixed point in time.
+
+    Each predicate is the standard library's own method, called in the same
+    order as ``DefaultCookiePolicy.return_ok()``. Expiry is checked with the
+    caller-supplied timestamp instead of ``policy._now`` so that nothing on
+    the jar or policy is mutated.
+    """
+    if not policy.return_ok_version(cookie, req):  # type: ignore[arg-type]
+        if (cookie.version or 0) > 0:
+            return False, (
+                f"RFC 2965 (version {cookie.version}) cookies are switched "
+                "off in the jar's policy"
+            )
+        return False, "Netscape cookies are switched off in the jar's policy"
+
+    if not policy.return_ok_verifiability(cookie, req):  # type: ignore[arg-type]
+        return False, (
+            "third-party cookie is not returned for this unverifiable "
+            "request by the jar's policy"
+        )
+
+    if not policy.return_ok_secure(cookie, req):  # type: ignore[arg-type]
+        protocols = cast(
+            "tuple[str, ...]",
+            getattr(policy, "secure_protocols", ("https", "wss")),
+        )
+        return False, (
+            f"secure cookie is not sent over the {req.type!r} scheme; it is "
+            f"only sent over one of: {', '.join(sorted(protocols))}"
+        )
+
+    # Mirrors DefaultCookiePolicy.return_ok_expires() with policy._now == now.
+    if cookie.is_expired(now):
+        return False, (
+            f"cookie has expired (expires={cookie.expires}, evaluated at {now})"
+        )
+
+    if not policy.return_ok_port(cookie, req):  # type: ignore[arg-type]
+        req_port = _request_port(req)
+        return False, (
+            f"request port {req_port!r} does not match cookie port {cookie.port!r}"
+        )
+
+    if not policy.return_ok_domain(cookie, req):  # type: ignore[arg-type]
+        effective_host = _safe_request_host(req)
+        kind = "host-only" if not cookie.domain_specified else "domain"
+        return False, (
+            f"the {kind} cookie domain {cookie.domain!r} does not "
+            f"domain-match the effective request host {effective_host!r}"
+        )
+
+    return True, (
+        "cookie matches the request host, path and policy; it would be sent "
+        "in the Cookie header"
+    )
+
+
+def _stdlib_selected_cookies(
+    policy: DefaultCookiePolicy,
+    storage: dict[str, dict[str, dict[str, Cookie]]],
+    req: MockRequest,
+    now: int,
+) -> set[tuple[str, str, str]]:
+    """Return the stdlib-selected cookies without touching the caller's jar.
+
+    A throwaway jar is built from copies of the policy and cookie storage, so
+    the standard library's own ``_cookies_for_request()`` decides at the same
+    point in time while the user's jar, its policy, cookies and request are
+    never mutated (in particular, ``add_cookie_header()`` and its
+    ``clear_expired_cookies()`` call are never invoked on the real jar).
+    """
+    policy_copy = copy.copy(policy)
+    setattr(policy_copy, "_now", now)
+    probe = CookieJar(policy=policy_copy)
+    setattr(probe, "_cookies", copy.deepcopy(storage))
+    selected = probe._cookies_for_request(req)  # type: ignore[attr-defined,arg-type]
+    return {
+        (cookie.name, cookie.domain, cookie.path)
+        for cookie in cast("list[Cookie]", selected)
+    }
+
+
+def explain_cookie_send(
+    jar: CookieJar, request: PreparedRequest
+) -> CookieSendExplanation:
+    """Explain which cookies from *jar* would be sent with *request*.
+
+    This is a local, read-only debugging aid: it does not send the request
+    and does not modify the jar, its policy, any cookie, the request or any
+    response. It evaluates every cookie against the exact same rules the
+    standard library uses when building the real ``Cookie`` header
+    (host/domain matching including subdomains and host-only cookies, path
+    matching, the secure/scheme check, expiry and ``Host``-header override).
+
+    Expiry is evaluated once, at a single point in time shared by every
+    cookie. The set of cookies reported as ``selected`` is verified against
+    the standard library's own selection for the same jar and
+    :class:`PreparedRequest`, so it matches the cookies that would appear in
+    the actual ``Cookie`` header.
+
+    Cookies sharing a name but differing in ``domain`` or ``path`` are
+    reported as separate entries; results are never keyed by name.
+
+    When the request already carries a ``Cookie`` header, that header takes
+    precedence: no jar cookies are reported as selected. The existing
+    header's content is never read or displayed.
+
+    No cookie value, authentication material, request header value or
+    request body is ever included in the result or in raised errors.
+
+    :param jar: any standard ``http.cookiejar.CookieJar`` (including
+        :class:`RequestsCookieJar`, ``LWPCookieJar`` and ``MozillaCookieJar``)
+        whose policy is an unmodified
+        :class:`~http.cookiejar.DefaultCookiePolicy`.
+    :param request: a prepared :class:`PreparedRequest`.
+    :raises TypeError: if *jar* is not a ``CookieJar``.
+    :raises CookiePolicyExplainError: if the jar or its
+        :class:`~http.cookiejar.CookiePolicy` overrides the standard
+        selection rules, so that safe per-cookie reasons cannot be given.
+    """
+    if not isinstance(jar, CookieJar):
+        raise TypeError(
+            f"explain_cookie_send() expected a CookieJar, got "
+            f"{type(jar).__name__!r} instead"
+        )
+    assert _is_prepared(request)
+
+    policy = cast(CookiePolicy, getattr(jar, "_policy"))
+    _explain_supported(jar, policy)
+    default_policy = cast(DefaultCookiePolicy, policy)
+
+    # Single timestamp is used for every expiry decision in this call.
+    now = int(time.time())
+
+    req = MockRequest(request)
+
+    parsed = urlparse(request.url)
+    url_host = parsed.hostname or ""
+    # Effective host, honouring a Host-header override, sanitised so that
+    # URL userinfo can never appear in the explanation.
+    req_host = _safe_request_host(req)
+    host_overridden = bool(req.get_header("Host")) and req_host != url_host
+    req_path = _request_path(req)
+
+    # Membership only -- the existing header value is never read.
+    explicit_cookie_header = req.has_header("Cookie")
+
+    choices: list[CookieSendChoice] = []
+    storage = cast("dict[str, dict[str, dict[str, Cookie]]]", getattr(jar, "_cookies"))
+
+    for domain in list(storage.keys()):
+        cookies_by_path = storage[domain]
+        # Standard CookieJar domain-key optimisation gate.
+        domain_ok = default_policy.domain_return_ok(domain, req)  # type: ignore[arg-type]
+        domain_reason: str | None = None
+        if not domain_ok:
+            domain_reason = _domain_gate_reason(default_policy, domain, req)
+
+        for path in list(cookies_by_path.keys()):
+            cookies_by_name = cookies_by_path[path]
+            path_ok = domain_ok and default_policy.path_return_ok(path, req)  # type: ignore[arg-type]
+
+            for name in list(cookies_by_name.keys()):
+                cookie = cookies_by_name[name]
+
+                expired = bool(cookie.is_expired(now))
+                host_only = not cookie.domain_specified
+
+                if not domain_ok:
+                    would_select = False
+                    reason: str | None = domain_reason
+                elif not path_ok:
+                    would_select = False
+                    reason = (
+                        f"request path {req_path!r} does not path-match "
+                        f"cookie path {path!r}; the request path must equal "
+                        "the cookie path or be a sub-path of it"
+                    )
+                else:
+                    would_select, reason = _cookie_return_reason(
+                        default_policy, cookie, req, now
+                    )
+
+                selected = would_select and not explicit_cookie_header
+                if would_select and explicit_cookie_header:
+                    reason = _EXPLICIT_HEADER_REASON
+
+                choices.append(
+                    CookieSendChoice(
+                        name=cookie.name,
+                        domain=cookie.domain,
+                        path=cookie.path,
+                        host_only=host_only,
+                        secure=bool(cookie.secure),
+                        expired=expired,
+                        selected=selected,
+                        reason=cast(str, reason),
+                    )
+                )
+
+    # Verify our replicated decisions against the standard library's own
+    # selection on an isolated copy, evaluated at the exact same timestamp.
+    explained_selection = {
+        (choice.name, choice.domain, choice.path)
+        for choice in choices
+        if choice.selected
+        or (choice.reason == _EXPLICIT_HEADER_REASON and not choice.selected)
+    }
+    actual_selection = _stdlib_selected_cookies(default_policy, storage, req, now)
+    if explained_selection != actual_selection:
+        raise CookiePolicyExplainError(
+            "Cannot safely explain cookie send-selection: the explained "
+            "selection does not match the cookies selected by the standard "
+            "library for this jar and request."
+        )
+
+    if explicit_cookie_header:
+        note = (
+            "The request already carries a Cookie header, which takes "
+            "precedence and is sent unchanged: no cookies from the jar are "
+            "added, and the existing header was neither read nor displayed."
+        )
+    else:
+        selected_count = len(actual_selection)
+        note = (
+            f"{selected_count} of {len(choices)} cookie(s) in the jar would "
+            "be sent in the Cookie header for this request."
+        )
+        if host_overridden:
+            note += (
+                f" Cookie matching uses the explicit Host header host "
+                f"{req_host!r} rather than the URL host {url_host!r}."
+            )
+
+    return CookieSendExplanation(
+        url_host=url_host,
+        host=req_host,
+        host_overridden=host_overridden,
+        scheme=req.type,
+        path=req_path,
+        explicit_cookie_header=explicit_cookie_header,
+        note=note,
+        cookies=choices,
+    )
 
 
 def remove_cookie_by_name(
